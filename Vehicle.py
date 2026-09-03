@@ -308,14 +308,15 @@ class StripVercelPrefixMiddleware:
         self.wsgi_app = wsgi_app
 
     def __call__(self, environ, start_response):
-        # 1. Check if Vercel passed the real requested path in HTTP_X_MATCHED_PATH or HTTP_X_FORWARDED_PATH
-        matched_path = environ.get("HTTP_X_MATCHED_PATH") or environ.get("HTTP_X_FORWARDED_PATH")
+        matched_path = (
+            environ.get("HTTP_X_MATCHED_PATH")
+            or environ.get("HTTP_X_FORWARDED_PATH")
+            or environ.get("HTTP_X_ORIGINAL_URI")
+        )
         if matched_path:
             clean_path = matched_path.split("?")[0].strip()
             if clean_path and not clean_path.startswith("/api/index"):
                 environ["PATH_INFO"] = clean_path
-            elif clean_path in ["/api/index.py", "/api/index"]:
-                environ["PATH_INFO"] = "/"
         else:
             path = environ.get("PATH_INFO", "")
             for prefix in ["/api/index.py", "/api/index"]:
@@ -337,11 +338,24 @@ def add_cors_headers(response):
     return response
 
 
-@app.route("/")
-@app.route("/api")
-@app.route("/api/index")
-@app.route("/api/index.py")
+@app.route("/", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/index", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/index.py", methods=["GET", "POST", "OPTIONS"])
 def index():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    # If Vercel rewrote a vehicle lookup request to index, auto-dispatch to vehicle_info()
+    has_vehicle_param = any(
+        request.args.get(k)
+        or (request.is_json and (request.get_json(silent=True) or {}).get(k))
+        or (request.form and request.form.get(k))
+        for k in ["query", "quiry", "number", "search_term", "reg_no"]
+    )
+    if has_vehicle_param:
+        return vehicle_info()
+
     return jsonify({"message": "VEHICLE API WORKING"}), 200
 
 

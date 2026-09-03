@@ -300,6 +300,26 @@ def is_authorized() -> bool:
     return bool(provided_key and provided_key.strip() in VALID_API_KEYS)
 
 
+class StripVercelPrefixMiddleware:
+    """
+    Normalizes PATH_INFO in case Vercel rewrites or forwards paths with /api/index or /api/index.py prefix
+    """
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        for prefix in ["/api/index.py", "/api/index"]:
+            if path.startswith(prefix):
+                path = path[len(prefix):] or "/"
+                environ["PATH_INFO"] = path
+                break
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = StripVercelPrefixMiddleware(app.wsgi_app)
+
+
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -309,12 +329,17 @@ def add_cors_headers(response):
 
 
 @app.route("/")
+@app.route("/api")
+@app.route("/api/index")
+@app.route("/api/index.py")
 def index():
     return jsonify({"message": "VEHICLE API WORKING"}), 200
 
 
 @app.route("/vehicle", methods=["GET", "POST", "OPTIONS"])
 @app.route("/api/vehicle", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/index/vehicle", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/index.py/vehicle", methods=["GET", "POST", "OPTIONS"])
 def vehicle_info():
     if request.method == "OPTIONS":
         return "", 204
@@ -396,6 +421,8 @@ def vehicle_info():
 
 @app.route("/health")
 @app.route("/api/health")
+@app.route("/api/index/health")
+@app.route("/api/index.py/health")
 def health():
     return jsonify({
         "status": "ok",

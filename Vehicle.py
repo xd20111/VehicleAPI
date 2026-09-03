@@ -12,14 +12,19 @@ from flask import Flask, jsonify, request
 # Set your API Key via Environment Variable 'API_KEY' or change default below
 DEFAULT_API_KEY = os.environ.get("API_KEY", "Vehicle-key_s0undw4v3")
 _api_keys_env = os.environ.get("API_KEYS", "")
-VALID_API_KEYS = {k.strip() for k in _api_keys_env.split(",") if k.strip()} if _api_keys_env else {DEFAULT_API_KEY}
+if _api_keys_env:
+    VALID_API_KEYS = {k.strip() for k in _api_keys_env.split(",") if k.strip()}
+else:
+    # Accept both default key and README documented key for convenience
+    VALID_API_KEYS = {DEFAULT_API_KEY, "your_secret_api_key"}
 
-UPSTREAM = "https://horizon.policyboss.com:5443/quote/vehicle_info_loggedin"
-SECRET_KEY = "SECRET-HZ07QRWY-JIBT-XRMQ-ZP95-J0RWP3DYRACW"
-CLIENT_KEY = "CLIENT-CNTP6NYE-CU9N-DUZW-CSPI-SH1IS4DOVHB9"
-SOURCE = "PB-BETA"
-UPSTREAM_TIMEOUT = 60
-CACHE_TTL = 3600
+UPSTREAM = os.environ.get("UPSTREAM_URL", "https://horizon.policyboss.com:5443/quote/vehicle_info_loggedin")
+SECRET_KEY = os.environ.get("UPSTREAM_SECRET_KEY", "SECRET-HZ07QRWY-JIBT-XRMQ-ZP95-J0RWP3DYRACW")
+CLIENT_KEY = os.environ.get("UPSTREAM_CLIENT_KEY", "CLIENT-CNTP6NYE-CU9N-DUZW-CSPI-SH1IS4DOVHB9")
+SOURCE = os.environ.get("UPSTREAM_SOURCE", "PB-BETA")
+# Tuned for serverless environments (e.g. Vercel 10-15s limit)
+UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", 10))
+CACHE_TTL = int(os.environ.get("CACHE_TTL", 3600))
 
 HEADERS = {
     "Content-Type": "application/json;charset=utf-8",
@@ -30,8 +35,9 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 }
 
+# Matches standard Indian state plates (e.g. DL01AB1234, MH12A1) and Bharat (BH) series (e.g. 22BH1234AA)
 REGEX = re.compile(
-    r"^[A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,3}\s?\d{4}$|^[A-Z]{2}\s?\d{1,2}\s?BH\s?\d{4}$", re.I
+    r"^[A-Z]{2}\s?\d{1,2}\s?[A-Z]{0,3}\s?\d{1,4}$|^\d{2}\s?BH\s?\d{4}\s?[A-Z]{1,2}$", re.I
 )
 REGEX_STRIP = re.compile(r"[\s-]+")
 
@@ -83,6 +89,13 @@ def parse_fastlane_response(fastlane_response):
     if not fastlane_response:
         return None
     
+    # If already a parsed dictionary or list
+    if isinstance(fastlane_response, (dict, list)):
+        return fastlane_response
+    
+    if not isinstance(fastlane_response, str):
+        return None
+    
     try:
         return json.loads(fastlane_response)
     except (json.JSONDecodeError, TypeError):
@@ -114,7 +127,7 @@ def parse_fastlane_response(fastlane_response):
             return result
         
         return {root.tag: element_to_dict(root)}
-    except ET.ParseError:
+    except (ET.ParseError, TypeError, Exception):
         return None
 
 
@@ -123,12 +136,22 @@ def clean_upstream(raw: dict) -> dict:
             "Is_LM", "FastLaneId", "Match_Mode", "FastlaneResponse", "FastlaneResponse_Obj"}
     no_vahan = raw.get("0") == "N" or all(k.isdigit() for k in list(raw)[:6])
     out = {k: v for k, v in raw.items() if k not in junk and not k.isdigit()}
-    out["found"] = not no_vahan and bool(out.get("Make_Name"))
     
     if "FastlaneResponse" in raw and raw["FastlaneResponse"]:
         parsed = parse_fastlane_response(raw["FastlaneResponse"])
         if parsed:
             out["vehicle_details"] = parsed
+            
+    has_details = bool(
+        out.get("Make_Name")
+        or out.get("Maker_Name")
+        or out.get("Model_Name")
+        or out.get("Vehicle_Make")
+        or out.get("vehicle_details")
+        or out.get("Registration_Number")
+        or out.get("Registration_No")
+    )
+    out["found"] = not no_vahan and has_details
     
     return out
 
@@ -144,8 +167,8 @@ def upstream_lookup(number: str, product_id: int):
         "session_id": "",
     }
     
-    max_retries = 5
-    retry_delay = 2
+    max_retries = int(os.environ.get("MAX_RETRIES", "2"))
+    retry_delay = 1
     
     for attempt in range(max_retries):
         try:
@@ -161,7 +184,7 @@ def upstream_lookup(number: str, product_id: int):
                             continue
                 except:
                     pass
-                raise RuntimeError("Upstream captcha gate triggered (unexpected)")
+                raise RuntimeError(f"Upstream forbidden or captcha gate triggered (HTTP 403): {resp.text[:120]}")
             
             if resp.status_code != 200:
                 if resp.status_code in [429, 503, 504] and attempt < max_retries - 1:
@@ -172,10 +195,14 @@ def upstream_lookup(number: str, product_id: int):
             try:
                 data = resp.json()
                 if data.get("status") == "error" or data.get("error"):
+                    msg = data.get("message") or data.get("error") or "Unknown API error"
+                    # Fast-fail for non-retryable validation or record-not-found errors
+                    if any(term in str(msg).lower() for term in ["not found", "no record", "invalid", "does not exist"]):
+                        raise ValueError(str(msg))
                     if attempt < max_retries - 1:
                         time.sleep(retry_delay)
                         continue
-                    raise RuntimeError(data.get("message") or data.get("error") or "Unknown API error")
+                    raise RuntimeError(str(msg))
                 return data
             except json.JSONDecodeError:
                 if attempt < max_retries - 1:
@@ -185,14 +212,16 @@ def upstream_lookup(number: str, product_id: int):
             
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
-                time.sleep(retry_delay * (attempt + 1))
+                time.sleep(retry_delay)
                 continue
             raise RuntimeError("Upstream request timeout")
         except requests.exceptions.ConnectionError:
             if attempt < max_retries - 1:
-                time.sleep(retry_delay * (attempt + 1))
+                time.sleep(retry_delay)
                 continue
             raise RuntimeError("Upstream connection error")
+        except ValueError:
+            raise
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
@@ -263,8 +292,20 @@ def is_authorized() -> bool:
     if not provided_key and request.is_json:
         body = request.get_json(silent=True) or {}
         provided_key = body.get("key") or body.get("api_key")
+
+    # Check form-encoded body if POST
+    if not provided_key and request.form:
+        provided_key = request.form.get("key") or request.form.get("api_key")
         
     return bool(provided_key and provided_key.strip() in VALID_API_KEYS)
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-KEY"
+    return response
 
 
 @app.route("/")
@@ -272,47 +313,67 @@ def index():
     return jsonify({"message": "VEHICLE API WORKING"}), 200
 
 
-@app.route("/vehicle", methods=["GET", "POST"])
-@app.route("/api/vehicle", methods=["GET", "POST"])
+@app.route("/vehicle", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/vehicle", methods=["GET", "POST", "OPTIONS"])
 def vehicle_info():
+    if request.method == "OPTIONS":
+        return "", 204
+
     # 1. Protect route with API key check
     if not is_authorized():
         return jsonify({
             "status": "error",
             "error": "Unauthorized",
-            "message": "Invalid or missing API key. Usage: /vehicle?key={api_key}&quiry={search_term}"
+            "message": "Invalid or missing API key. Usage: /vehicle?key={api_key}&query={vehicle_number}"
         }), 401
 
-    json_body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    json_body = request.get_json(silent=True) or {} if request.method == "POST" and request.is_json else {}
+    form_body = request.form if request.form else {}
 
-    # 2. Support 'quiry' (and aliases: 'query', 'number', 'search_term', 'reg_no')
+    # 2. Support 'query' (and aliases: 'quiry', 'number', 'search_term', 'reg_no')
     number = (
-        request.args.get("quiry")
-        or request.args.get("query")
+        request.args.get("query")
+        or request.args.get("quiry")
         or request.args.get("number")
         or request.args.get("search_term")
         or request.args.get("reg_no")
-        or json_body.get("quiry")
         or json_body.get("query")
+        or json_body.get("quiry")
         or json_body.get("number")
         or json_body.get("search_term")
         or json_body.get("reg_no")
+        or form_body.get("query")
+        or form_body.get("quiry")
+        or form_body.get("number")
+        or form_body.get("search_term")
+        or form_body.get("reg_no")
     )
 
     try:
-        product_id = int(request.args.get("product_id", json_body.get("product_id", 1)))
+        raw_product_id = (
+            request.args.get("product_id")
+            or json_body.get("product_id")
+            or form_body.get("product_id")
+            or 1
+        )
+        product_id = int(raw_product_id)
     except (ValueError, TypeError):
         product_id = 1
     product_id = max(1, min(product_id, 12))
     
-    cache_arg = request.args.get("cache") or json_body.get("cache") or "yes"
+    cache_arg = (
+        request.args.get("cache")
+        or json_body.get("cache")
+        or form_body.get("cache")
+        or "yes"
+    )
     use_cache = str(cache_arg).lower() != "no"
 
     if not number:
         return jsonify({
             "status": "error",
             "error": "Missing search term",
-            "message": "Missing 'quiry' parameter. Usage: /vehicle?key={api_key}&quiry={search_term}"
+            "message": "Missing 'query' parameter. Usage: /vehicle?key={api_key}&query={vehicle_number}"
         }), 400
 
     norm = normalize_number(str(number))
@@ -334,6 +395,7 @@ def vehicle_info():
 
 
 @app.route("/health")
+@app.route("/api/health")
 def health():
     return jsonify({
         "status": "ok",

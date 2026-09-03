@@ -302,18 +302,27 @@ def is_authorized() -> bool:
 
 class StripVercelPrefixMiddleware:
     """
-    Normalizes PATH_INFO in case Vercel rewrites or forwards paths with /api/index or /api/index.py prefix
+    Normalizes PATH_INFO so Flask routes the actual requested path on Vercel
     """
     def __init__(self, wsgi_app):
         self.wsgi_app = wsgi_app
 
     def __call__(self, environ, start_response):
-        path = environ.get("PATH_INFO", "")
-        for prefix in ["/api/index.py", "/api/index"]:
-            if path.startswith(prefix):
-                path = path[len(prefix):] or "/"
-                environ["PATH_INFO"] = path
-                break
+        # 1. Check if Vercel passed the real requested path in HTTP_X_MATCHED_PATH or HTTP_X_FORWARDED_PATH
+        matched_path = environ.get("HTTP_X_MATCHED_PATH") or environ.get("HTTP_X_FORWARDED_PATH")
+        if matched_path:
+            clean_path = matched_path.split("?")[0].strip()
+            if clean_path and not clean_path.startswith("/api/index"):
+                environ["PATH_INFO"] = clean_path
+            elif clean_path in ["/api/index.py", "/api/index"]:
+                environ["PATH_INFO"] = "/"
+        else:
+            path = environ.get("PATH_INFO", "")
+            for prefix in ["/api/index.py", "/api/index"]:
+                if path.startswith(prefix):
+                    path = path[len(prefix):] or "/"
+                    environ["PATH_INFO"] = path
+                    break
         return self.wsgi_app(environ, start_response)
 
 
